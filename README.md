@@ -1247,3 +1247,274 @@ dotnet run -- 127.0.0.1 5000 ./downloads
 * **サイズ上限**を設けたい場合は、ヘッダ受信直後に `bodyLen` をチェックして中断してください。
 
 必要なら **PUSH + 通常応答（PONG 等）の混在をきれいに扱う拡張**や、**到着ファイルのハッシュ検証**も足せます。
+
+いいね。`PUSH`（バイナリ枠）と、`PONG`/`SUBSCRIBED`/`OK`/`ERR:...`（行テキスト応答）が**同じTCPストリームに混在**しても綺麗に扱えるように、
+小さな**バッファ付きリーダ（Peek/ReadLine/ReadExactly）**を用意して**フレーム or 行**を判別して処理します。
+
+* `0x10` が来たら **PUSHフレーム**として `nameLen/name/bodyLen/body` を読み取り保存（アトミック）
+* それ以外なら **1行テキスト**として読み取りログに出す（`PONG` など）
+* ついでに**定期PING**（30秒ごと）も同接続で送る例を入れています
+
+---
+
+## Program.cs（PUSH + 行応答 混在処理クライアント / .NET 8）
+
+```csharp
+// dotnet new console -n PushClientMix && cd PushClientMix
+// 置き換えて: dotnet run -- 127.0.0.1 5000 ./downloads
+using System.Buffers.Binary;
+using System.Net.Sockets;
+using System.Text;
+
+string host   = args.Length >= 1 ? args[0] : "127.0.0.1";
+int    port   = args.Length >= 2 ? int.Parse(args[1]) : 5000;
+string outDir = args.Length >= 3 ? args[2] : "./downloads";
+Directory.CreateDirectory(outDir);
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+Console.WriteLine($"Connecting to {host}:{port} ...");
+using var tcp = new TcpClient();
+await tcp.ConnectAsync(host, port, cts.Token);
+using var ns = tcp.GetStream();
+
+// ------- SUBSCRIBE (0x06) -------
+await ns.WriteAsync(new byte[] { 0x06 }, cts.Token);
+Console.WriteLine("Subscribed. Will accept PUSH (0x10) and line responses together.");
+
+// ------- keepalive ping task (optional) -------
+var pingTask = Task.Run(async () =>
+{
+    var pingBuf = new byte[] { 0x05 }; // PING
+    while (!cts.IsCancellationRequested)
+    {
+        try
+        {
+            await ns.WriteAsync(pingBuf, cts.Token);
+        }
+        catch { /* ignore; reader loop will end on disconnect */ }
+        await Task.Delay(TimeSpan.FromSeconds(30), cts.Token);
+    }
+}, cts.Token);
+
+// ------- reader with small internal buffer -------
+var br = new BufferedReader(ns);
+
+try
+{
+    while (!cts.IsCancellationRequested)
+    {
+        int b = await br.PeekByteAsync(cts.Token);
+        if (b < 0) break; // disconnected
+
+        if ((byte)b == 0x10)
+        {
+            // ---- PUSH frame: [0x10][int32 nameLen][name][int64 bodyLen][body] ----
+            await br.ReadByteAsync(cts.Token); // consume 0x10
+
+            int nameLen = await br.ReadInt32LEAsync(cts.Token);
+            if (nameLen <= 0 || nameLen > 4096) throw new InvalidOperationException("bad name length");
+
+            var nameBytes = await br.ReadExactlyAsync(nameLen, cts.Token);
+            var fileName  = SanitizeFileName(Encoding.UTF8.GetString(nameBytes));
+
+            long bodyLen = await br.ReadInt64LEAsync(cts.Token);
+            if (bodyLen < 0) throw new InvalidOperationException("bad body length");
+
+            string destPath = Path.GetFullPath(Path.Combine(outDir, fileName));
+            Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+            string tempPath = Path.Combine(Path.GetDirectoryName(destPath)!,
+                                           $".{Path.GetFileName(destPath)}.{Guid.NewGuid():N}.tmp");
+
+            long remaining = bodyLen;
+            long received  = 0;
+            try
+            {
+                await using var fs = new FileStream(
+                    tempPath,
+                    new FileStreamOptions {
+                        Mode = FileMode.CreateNew,
+                        Access = FileAccess.Write,
+                        Share = FileShare.None,
+                        Options = FileOptions.Asynchronous /* | FileOptions.WriteThrough */
+                    });
+
+                var buf = new byte[81920];
+                while (remaining > 0)
+                {
+                    int toRead = (int)Math.Min(buf.Length, remaining);
+                    int n = await br.ReadIntoBufferAsync(buf.AsMemory(0, toRead), cts.Token);
+                    if (n == 0) throw new IOException("unexpected EOF (body)");
+                    await fs.WriteAsync(buf.AsMemory(0, n), cts.Token);
+                    remaining -= n;
+                    received  += n;
+                }
+
+                await fs.FlushAsync(cts.Token);
+                File.Move(tempPath, destPath, overwrite: true);
+                Console.WriteLine($"[PUSH] saved: {destPath} ({received} bytes)");
+            }
+            catch
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                throw;
+            }
+        }
+        else
+        {
+            // ---- Line response (PONG/SUBSCRIBED/OK/ERR:...) ----
+            string line = await br.ReadLineAsync(cts.Token);
+            if (line == null) break;
+            Console.WriteLine($"[LINE] {line}");
+        }
+    }
+}
+catch (OperationCanceledException) { /* Ctrl+C */ }
+
+cts.Cancel(); // stop pinger
+try { await pingTask; } catch { }
+Console.WriteLine("bye");
+
+// ====================== Helpers ======================
+
+static string SanitizeFileName(string name)
+{
+    foreach (var c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
+    name = name.Replace("/", "_").Replace("\\", "_").Replace("..", "_");
+    return name;
+}
+
+/// <summary>
+/// Small buffered reader: supports PeekByte / ReadByte / ReadLine (LF) / ReadInt32/64 LE / ReadExactly
+/// and a method to fill a user buffer (for body streaming).
+/// </summary>
+sealed class BufferedReader
+{
+    private readonly NetworkStream _s;
+    private byte[] _buf;
+    private int _pos;
+    private int _len;
+
+    public BufferedReader(NetworkStream s, int capacity = 32 * 1024)
+    {
+        _s = s;
+        _buf = new byte[capacity];
+    }
+
+    public async Task<int> PeekByteAsync(CancellationToken ct)
+    {
+        if (_pos >= _len)
+            await FillAsync(ct);
+        return _pos < _len ? _buf[_pos] : -1;
+    }
+
+    public async Task<int> ReadByteAsync(CancellationToken ct)
+    {
+        if (_pos >= _len)
+            await FillAsync(ct);
+        if (_pos >= _len) return -1;
+        return _buf[_pos++];
+    }
+
+    public async Task<string> ReadLineAsync(CancellationToken ct)
+    {
+        var sb = new StringBuilder();
+        while (true)
+        {
+            if (_pos >= _len && !await FillAsync(ct))
+                return sb.Length == 0 ? null : sb.ToString(); // EOF
+
+            for (; _pos < _len; _pos++)
+            {
+                byte b = _buf[_pos];
+                if (b == (byte)'\n')
+                {
+                    _pos++; // consume LF
+                    // trim optional CR
+                    if (sb.Length > 0 && sb[^1] == '\r') sb.Length--;
+                    return sb.ToString();
+                }
+                sb.Append((char)b);
+            }
+        }
+    }
+
+    public async Task<byte[]> ReadExactlyAsync(int count, CancellationToken ct)
+    {
+        var dst = new byte[count];
+        int off = 0;
+        while (off < count)
+        {
+            int copied = CopyFromInternal(dst.AsSpan(off));
+            if (copied == 0)
+            {
+                if (!await FillAsync(ct)) throw new IOException("unexpected EOF");
+                continue;
+            }
+            off += copied;
+        }
+        return dst;
+    }
+
+    public async Task<int> ReadIntoBufferAsync(Memory<byte> dest, CancellationToken ct)
+    {
+        // Prefer internal buffer first
+        int copied = CopyFromInternal(dest.Span);
+        if (copied > 0) return copied;
+
+        // If request is big, read directly into dest to avoid extra copy
+        if (dest.Length >= _buf.Length)
+        {
+            int n = await _s.ReadAsync(dest, ct);
+            _pos = _len = 0;
+            return n;
+        }
+
+        // Otherwise, fill internal and try again
+        if (!await FillAsync(ct)) return 0;
+        return CopyFromInternal(dest.Span);
+    }
+
+    public async Task<int> ReadInt32LEAsync(CancellationToken ct)
+    {
+        var bytes = await ReadExactlyAsync(4, ct);
+        return BinaryPrimitives.ReadInt32LittleEndian(bytes);
+    }
+
+    public async Task<long> ReadInt64LEAsync(CancellationToken ct)
+    {
+        var bytes = await ReadExactlyAsync(8, ct);
+        return BinaryPrimitives.ReadInt64LittleEndian(bytes);
+    }
+
+    // ---- internal helpers ----
+    private int CopyFromInternal(Span<byte> dest)
+    {
+        int available = _len - _pos;
+        if (available <= 0) return 0;
+        int toCopy = Math.Min(dest.Length, available);
+        _buf.AsSpan(_pos, toCopy).CopyTo(dest);
+        _pos += toCopy;
+        return toCopy;
+    }
+
+    private async Task<bool> FillAsync(CancellationToken ct)
+    {
+        _pos = 0;
+        _len = await _s.ReadAsync(_buf, ct);
+        return _len > 0;
+    }
+}
+```
+
+### 何をしているか
+
+* **先読み `PeekByteAsync`** で次の1バイトが `0x10` なら PUSH と判断、そうでなければ行テキストとして処理。
+* **BufferedReader** を挟むことで、`ReadLine` と **ボディの大きな連続読み**を同じストリームで安全に両立。
+* PUSH保存は**一時ファイル→Move**でアトミック。
+* 任意の**定期PING**も同接続で実行（なくてもOK）。
+
+> サーバー側で `SUBSCRIBE` のACKを行テキストで返す（`SUBSCRIBED\n`）、`PING` に `PONG\n` を返す、`UPLOAD`のACKに `OK\n` を返す、のような**行応答**と混在しても安全に処理できます。
+
+必要なら、ここに**最大受信サイズ**のチェックや**保存先のサブディレクトリ分岐**、**ハッシュ検証**を足すパッチも書けます。
