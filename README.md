@@ -1518,3 +1518,313 @@ sealed class BufferedReader
 > サーバー側で `SUBSCRIBE` のACKを行テキストで返す（`SUBSCRIBED\n`）、`PING` に `PONG\n` を返す、`UPLOAD`のACKに `OK\n` を返す、のような**行応答**と混在しても安全に処理できます。
 
 必要なら、ここに**最大受信サイズ**のチェックや**保存先のサブディレクトリ分岐**、**ハッシュ検証**を足すパッチも書けます。
+
+
+了解、「実際に Azure に送る」のではなく、**“Azure Blob SDK っぽい形・書き味”**で、あなたの独自サーバープロトコル（`0x01..0x05`）に対して動くクライアントを書きたい、ということね。
+下に **最小の擬似 SDK（ミニマルな `BlobServiceClient` / `BlobContainerClient` / `BlobClient` 風）** を置きます。見た目は Azure と似せつつ、中身はあなたの TCP プロトコルをしゃべります。
+
+---
+
+# 使い方イメージ（Azure SDK の書き味）
+
+```csharp
+// “Azure 風”の形で使える
+var svc = new MiniBlobServiceClient("127.0.0.1", 5000);
+var container = svc.GetBlobContainerClient("uploads"); // 名前はそのままパス接頭辞に使う例
+var blob = container.GetBlobClient("report.pdf");
+
+// アップロード（ストリーム）
+await using var fs = File.OpenRead("./report.pdf");
+await blob.UploadAsync(fs, overwrite: true, contentType: "application/pdf",
+    progress: new Progress<long>(b => Console.Write($"\r{b} bytes")));
+
+// Stat
+var props = await blob.GetPropertiesAsync();
+Console.WriteLine($"\nSize={props.ContentLength}, LastModified={props.LastModified:o}");
+
+// ダウンロード
+await blob.DownloadToAsync("./dl_report.pdf");
+
+// List
+await foreach (var item in container.GetBlobsAsync())
+{
+    Console.WriteLine($"{item.Name}  {item.ContentLength} bytes  {item.LastModified:o}");
+}
+```
+
+---
+
+# ライブラリ本体（1ファイルで OK：MiniBlob.cs）
+
+```csharp
+using System.Buffers.Binary;
+using System.Net.Sockets;
+using System.Text;
+
+public sealed class MiniBlobServiceClient
+{
+    public string Host { get; }
+    public int Port { get; }
+
+    public MiniBlobServiceClient(string host, int port)
+        => (Host, Port) = (host, port);
+
+    public MiniBlobContainerClient GetBlobContainerClient(string name)
+        => new MiniBlobContainerClient(this, name);
+}
+
+public sealed class MiniBlobContainerClient
+{
+    private readonly MiniBlobServiceClient _svc;
+    public string Name { get; }
+
+    internal MiniBlobContainerClient(MiniBlobServiceClient svc, string name)
+        => (_svc, Name) = (svc, name);
+
+    public MiniBlobClient GetBlobClient(string blobName)
+        => new MiniBlobClient(_svc, Name, blobName);
+
+    // “Azure 風”に IAsyncEnumerable で列挙
+    public async IAsyncEnumerable<MiniBlobItem> GetBlobsAsync(CancellationToken ct = default)
+    {
+        using var tcp = new TcpClient();
+        await tcp.ConnectAsync(_svc.Host, _svc.Port, ct);
+        using var s = tcp.GetStream();
+
+        // LIST (0x03) : コンテナ名の prefix を行テキストで伝える簡易拡張（なくてもOK）
+        await s.WriteAsync(new byte[] { 0x03 }, ct);
+
+        // サーバーがコンテナを知らないなら、全件が返る想定。ここでは全件を受けてから prefix フィルタ。
+        int count = await ReadInt32LEAsync(s, ct);
+        for (int i = 0; i < count; i++)
+        {
+            int nameLen = await ReadInt32LEAsync(s, ct);
+            string name = await ReadUtf8Async(s, nameLen, ct);
+            long size = await ReadInt64LEAsync(s, ct);
+            long mtime = await ReadInt64LEAsync(s, ct);
+            if (name.StartsWith(Name + "/", StringComparison.Ordinal))
+            {
+                yield return new MiniBlobItem
+                {
+                    Name = name,
+                    ContentLength = size,
+                    LastModified = DateTimeOffset.FromUnixTimeSeconds(mtime).UtcDateTime
+                };
+            }
+        }
+    }
+}
+
+public sealed class MiniBlobClient
+{
+    private readonly MiniBlobServiceClient _svc;
+    public string BlobName { get; }     // container/prefix を含めた完全名にしておく
+    public string ContainerName { get; }
+
+    internal MiniBlobClient(MiniBlobServiceClient svc, string container, string blobName)
+    {
+        _svc = svc;
+        ContainerName = container;
+        BlobName = $"{container}/{blobName}".Replace("\\", "/");
+    }
+
+    // “Azure 風” UploadAsync（最低限）
+    public async Task UploadAsync(Stream content, bool overwrite = true, string? contentType = null,
+                                  IProgress<long>? progress = null, long? maxBytes = null,
+                                  CancellationToken ct = default)
+    {
+        // まず全長（maxBytes 指定が無ければストリーム長から）を決める
+        long length = content.CanSeek ? (content.Length - content.Position)
+                                      : throw new InvalidOperationException("stream must be seekable or specify length");
+        if (maxBytes.HasValue && length > maxBytes.Value)
+            throw new InvalidOperationException("file too large");
+
+        using var tcp = new TcpClient();
+        await tcp.ConnectAsync(_svc.Host, _svc.Port, ct);
+        using var s = tcp.GetStream();
+
+        // UPLOAD (0x01)
+        await s.WriteAsync(new byte[] { 0x01 }, ct);
+
+        // name (container/prefix + filename)
+        var nameBytes = Encoding.UTF8.GetBytes(BlobName);
+        await WriteInt32LEAsync(s, nameBytes.Length, ct);
+        await s.WriteAsync(nameBytes, ct);
+
+        // bodyLen
+        await WriteInt64LEAsync(s, length, ct);
+
+        // body（チャンクで送る）
+        var buf = new byte[81920];
+        long sent = 0;
+        while (sent < length)
+        {
+            int toRead = (int)Math.Min(buf.Length, length - sent);
+            int n = await content.ReadAsync(buf.AsMemory(0, toRead), ct);
+            if (n == 0) throw new IOException("unexpected EOF from source stream");
+            await s.WriteAsync(buf.AsMemory(0, n), ct);
+            sent += n;
+            progress?.Report(sent);
+        }
+
+        // ACK テキストを軽く消費（OK\n/ERR:...）
+        await ReadLineAsync(s, ct); // 使わないが読み捨て
+    }
+
+    // “Azure 風” DownloadToAsync
+    public async Task DownloadToAsync(string localPath, CancellationToken ct = default)
+    {
+        using var tcp = new TcpClient();
+        await tcp.ConnectAsync(_svc.Host, _svc.Port, ct);
+        using var s = tcp.GetStream();
+
+        // DOWNLOAD (0x02)
+        await s.WriteAsync(new byte[] { 0x02 }, ct);
+        var nameBytes = Encoding.UTF8.GetBytes(BlobName);
+        await WriteInt32LEAsync(s, nameBytes.Length, ct);
+        await s.WriteAsync(nameBytes, ct);
+
+        long bodyLen = await ReadInt64LEAsync(s, ct);
+        if (bodyLen < 0) throw new FileNotFoundException(BlobName);
+
+        Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(localPath))!);
+        string temp = Path.Combine(Path.GetDirectoryName(localPath)!,
+                                   $".{Path.GetFileName(localPath)}.{Guid.NewGuid():N}.tmp");
+
+        try
+        {
+            await using var fs = new FileStream(temp, new FileStreamOptions
+            {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                Options = FileOptions.Asynchronous
+            });
+
+            var buf = new byte[81920];
+            long remaining = bodyLen;
+            while (remaining > 0)
+            {
+                int toRead = (int)Math.Min(buf.Length, remaining);
+                int n = await s.ReadAsync(buf.AsMemory(0, toRead), ct);
+                if (n == 0) throw new IOException("unexpected EOF (body)");
+                await fs.WriteAsync(buf.AsMemory(0, n), ct);
+                remaining -= n;
+            }
+            await fs.FlushAsync(ct);
+            File.Move(temp, localPath, overwrite: true);
+        }
+        catch
+        {
+            try { if (File.Exists(temp)) File.Delete(temp); } catch { }
+            throw;
+        }
+    }
+
+    // “Azure 風” GetPropertiesAsync
+    public async Task<MiniBlobProperties> GetPropertiesAsync(CancellationToken ct = default)
+    {
+        using var tcp = new TcpClient();
+        await tcp.ConnectAsync(_svc.Host, _svc.Port, ct);
+        using var s = tcp.GetStream();
+
+        // STAT (0x04)
+        await s.WriteAsync(new byte[] { 0x04 }, ct);
+        var nameBytes = Encoding.UTF8.GetBytes(BlobName);
+        await WriteInt32LEAsync(s, nameBytes.Length, ct);
+        await s.WriteAsync(nameBytes, ct);
+
+        int exists = s.ReadByte();
+        if (exists != 1) throw new FileNotFoundException(BlobName);
+
+        long size = await ReadInt64LEAsync(s, ct);
+        long mtime = await ReadInt64LEAsync(s, ct);
+        return new MiniBlobProperties
+        {
+            ContentLength = size,
+            LastModified = DateTimeOffset.FromUnixTimeSeconds(mtime).UtcDateTime
+        };
+    }
+
+    // Exists
+    public async Task<bool> ExistsAsync(CancellationToken ct = default)
+    {
+        try { _ = await GetPropertiesAsync(ct); return true; }
+        catch (FileNotFoundException) { return false; }
+    }
+
+    // 便利：同期的に文字列アップロード
+    public Task UploadStringAsync(string text, CancellationToken ct = default)
+        => UploadAsync(new MemoryStream(Encoding.UTF8.GetBytes(text)), overwrite: true, ct: ct);
+
+    // ---- low-level helpers (stream I/O) ----
+    private static async Task<int> ReadInt32LEAsync(NetworkStream s, CancellationToken ct)
+    {
+        var buf = new byte[4]; int off = 0;
+        while (off < 4) { int n = await s.ReadAsync(buf.AsMemory(off), ct); if (n == 0) throw new IOException("EOF"); off += n; }
+        return BinaryPrimitives.ReadInt32LittleEndian(buf);
+    }
+    private static async Task<long> ReadInt64LEAsync(NetworkStream s, CancellationToken ct)
+    {
+        var buf = new byte[8]; int off = 0;
+        while (off < 8) { int n = await s.ReadAsync(buf.AsMemory(off), ct); if (n == 0) throw new IOException("EOF"); off += n; }
+        return BinaryPrimitives.ReadInt64LittleEndian(buf);
+    }
+    private static async Task<string> ReadUtf8Async(NetworkStream s, int len, CancellationToken ct)
+    {
+        var buf = new byte[len]; int off = 0;
+        while (off < len) { int n = await s.ReadAsync(buf.AsMemory(off), ct); if (n == 0) throw new IOException("EOF"); off += n; }
+        return Encoding.UTF8.GetString(buf);
+    }
+    private static async Task WriteInt32LEAsync(NetworkStream s, int v, CancellationToken ct)
+    {
+        Span<byte> b = stackalloc byte[4]; BinaryPrimitives.WriteInt32LittleEndian(b, v);
+        await s.WriteAsync(b.ToArray(), ct);
+    }
+    private static async Task WriteInt64LEAsync(NetworkStream s, long v, CancellationToken ct)
+    {
+        Span<byte> b = stackalloc byte[8]; BinaryPrimitives.WriteInt64LittleEndian(b, v);
+        await s.WriteAsync(b.ToArray(), ct);
+    }
+    private static async Task<string?> ReadLineAsync(NetworkStream s, CancellationToken ct)
+    {
+        var ms = new MemoryStream();
+        var one = new byte[1];
+        while (true)
+        {
+            int n = await s.ReadAsync(one.AsMemory(0, 1), ct);
+            if (n == 0) return ms.Length == 0 ? null : Encoding.UTF8.GetString(ms.ToArray());
+            if (one[0] == (byte)'\n') return Encoding.UTF8.GetString(ms.ToArray()).TrimEnd('\r');
+            ms.WriteByte(one[0]);
+        }
+    }
+}
+
+public sealed class MiniBlobItem
+{
+    public required string Name { get; init; }
+    public required long ContentLength { get; init; }
+    public required DateTime LastModified { get; init; }
+}
+
+public sealed class MiniBlobProperties
+{
+    public required long ContentLength { get; init; }
+    public required DateTime LastModified { get; init; }
+}
+```
+
+---
+
+## ねらい・特徴
+
+* **API の “かたち” を Azure Blob に寄せた**ので、将来本物に差し替えやすい（リファクタ範囲が小さくなる）
+* 中身はあなたの **TCP コマンド（0x01..0x04）** をしゃべるだけ
+* `UploadAsync(Stream …, progress)`、`DownloadToAsync(path)`、`GetPropertiesAsync()`、`ExistsAsync()`、`GetBlobsAsync()` を用意
+* 保存はクライアント側ダウンロード時も**アトミック**（一時ファイル→`Move`）
+
+> さらに Azure に寄せたいなら、`BlobRequestConditions` や `ETag`、`If-None-Match` 相当の条件分岐・戻り値型を追加していけます（あなたのサーバープロトコルに条件を足す必要はあります）。
+
+---
+
+必要なら、この擬似 SDK を**DI 可能なインターフェース**に切り出したり、**本物の `Azure.Storage.Blobs` 実装と切り替えられるアダプタ**（Strategy パターン）も用意できます。どこまで寄せたい？
