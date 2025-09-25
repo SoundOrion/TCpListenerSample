@@ -859,3 +859,391 @@ static async ValueTask CopyFromPipeToStreamWithMaxAsync(
 ---
 
 必要なら、「上限超過時の**専用エラーコードを返す**」などプロトコルの応答も整えます（`ERR:TOO_LARGE\n` 等）。
+
+できます。意味としては主に2通りあります：
+
+1. **クライアント1台 → 複数サーバーへ同じファイルを配る（マルチターゲット送信）**
+2. **クライアント1台 → 1つのサーバーへアップロードすると、サーバーが複数クライアントへ配信（ブロードキャスト／Pub-Sub）**
+
+下に**どちらも最小実装**を置きます。いまのプロトコル（UPLOAD/ DOWNLOAD）を壊さずに拡張します。
+
+---
+
+# 1) クライアント側で複数サーバーへ並列アップロード（最短ルート）
+
+既存の `UPLOAD (0x01)` をそのまま使い、接続先を複数にするだけ。
+（※エラー時のリトライ・タイムアウトは適宜足してください）
+
+```csharp
+public static async Task MultiUploadAsync(string[] hosts, int port, string localPath, int maxParallel = 4)
+{
+    using var sem = new SemaphoreSlim(maxParallel);
+    var tasks = hosts.Select(async host =>
+    {
+        await sem.WaitAsync();
+        try
+        {
+            await UploadAsync(host, port, localPath); // 既存の単発 Upload を流用
+            Console.WriteLine($"OK: {host}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"NG: {host} -> {ex.Message}");
+        }
+        finally { sem.Release(); }
+    });
+    await Task.WhenAll(tasks);
+}
+
+// 既存の UPLOAD (0x01) をホスト引数付きに
+static async Task UploadAsync(string host, int port, string localPath)
+{
+    using var tcp = new TcpClient();
+    await tcp.ConnectAsync(host, port);
+    using var s = tcp.GetStream();
+
+    await s.WriteAsync(new byte[] { 0x01 }); // UPLOAD
+    var fileName = Path.GetFileName(localPath);
+    var nameBytes = Encoding.UTF8.GetBytes(fileName);
+    await WriteInt32LEAsync(s, nameBytes.Length);
+    await s.WriteAsync(nameBytes);
+
+    long len = new FileInfo(localPath).Length;
+    await WriteInt64LEAsync(s, len);
+
+    await using var fs = File.OpenRead(localPath);
+    var buf = new byte[81920];
+    int n;
+    while ((n = await fs.ReadAsync(buf)) > 0)
+        await s.WriteAsync(buf.AsMemory(0, n));
+
+    // ACK
+    var ack = new byte[256];
+    int ackN = await s.ReadAsync(ack);
+    if (ackN <= 0) throw new IOException("no ack");
+}
+```
+
+これで**1→多**がすぐ動きます。配布先を増やす、レプリカ戦略（全成功/過半数成功）を決める、などはこの層で制御できます。
+
+---
+
+# 2) サーバーで受けた1回のUPLOADを、接続中クライアントへ自動配信（ブロードキャスト）
+
+プロトコルを**後方互換のまま**薄く拡張します：
+
+* `0x06 = SUBSCRIBE` … クライアントが「配信を受けたい」と宣言
+* `0x10 = PUSH` … サーバー→クライアントへの**サーバー起点**のファイル配信フレーム
+
+  ```
+  [0x10][int32 nameLen][name][int64 bodyLen][body]
+  ```
+
+クライアントは接続後に `0x06` を一度送るだけでOK。以降、誰かが `UPLOAD` するとサーバーが全サブスクライバへ `PUSH` を送ります。
+
+## サーバー（Pipelines 版、抜粋パッチ）
+
+* 接続ごとに「書き込みキュー」を直列化するため `SemaphoreSlim` を持たせます（他コマンドの応答と `PUSH` が混ざらないように）。
+* サーバーは**保存済みのファイル**を、各サブスクライバの `PipeWriter` へ `PUSH` で送ります。遅いクライアントは個別に遅延するだけで、他に影響しない設計に。
+
+```csharp
+// 共有：サブスクライバの管理
+static readonly ConcurrentDictionary<Guid, Subscriber> Subscribers = new();
+
+sealed class Subscriber
+{
+    public required PipeWriter Writer { get; init; }
+    public required SemaphoreSlim SendLock { get; init; } // 直列化用
+    public required CancellationToken ConnectionToken { get; init; }
+}
+
+// ServeAsync 内：接続単位の登録/解除
+var subId = Guid.NewGuid();
+var sendLock = new SemaphoreSlim(1,1);
+try
+{
+    // ...既存ループ...
+    switch (first)
+    {
+        case 0x06: // SUBSCRIBE
+            Subscribers[subId] = new Subscriber { Writer = writer, SendLock = sendLock, ConnectionToken = ct };
+            // 任意のACK（省略可）
+            WriteUtf8(writer, "SUBSCRIBED\n"); await writer.FlushAsync(ct);
+            break;
+
+        // 既存: 0x01..0x05 はそのまま
+    }
+}
+finally
+{
+    Subscribers.TryRemove(subId, out _);
+    sendLock.Dispose();
+}
+```
+
+### UPLOAD 完了時に配信する
+
+既存の `HandleUploadAsync` の保存成功直後に**ブロードキャスト**を足します。
+
+```csharp
+// 保存成功後
+Console.WriteLine($"[UPLOAD] {destPath} ({bodyLen} bytes)");
+WriteUtf8(writer, "OK\n");
+await writer.FlushAsync(ct);
+
+// ここから配信
+await BroadcastPushAsync(Path.GetFileName(destPath), destPath, ct);
+```
+
+### BroadcastPushAsync の実装
+
+```csharp
+static async Task BroadcastPushAsync(string fileName, string fullPath, CancellationToken serverCt)
+{
+    if (!File.Exists(fullPath)) return;
+
+    var nameBytes = Encoding.UTF8.GetBytes(fileName);
+    var fi = new FileInfo(fullPath);
+    long bodyLen = fi.Length;
+
+    // 各サブスクライバに独立に送る（並列可だが、送信は各接続で直列化）
+    var tasks = Subscribers.Values.Select(async sub =>
+    {
+        if (sub.ConnectionToken.IsCancellationRequested) return;
+        await sub.SendLock.WaitAsync(); // この接続向け送信の直列化
+        try
+        {
+            // PUSH ヘッダ
+            WriteByte(sub.Writer, 0x10);
+            WriteInt32LE(sub.Writer, nameBytes.Length);
+            WriteBytes(sub.Writer, nameBytes);
+            WriteInt64LE(sub.Writer, bodyLen);
+            await sub.Writer.FlushAsync(serverCt);
+
+            // ボディ（ファイル→PipeWriter）
+            await using var fs = File.OpenRead(fullPath);
+            await CopyFromStreamToPipeAsync(fs, sub.Writer, bodyLen, serverCt);
+        }
+        catch
+        {
+            // エラー時は無視（必要ならここで接続クローズや除名）
+        }
+        finally
+        {
+            sub.SendLock.Release();
+        }
+    });
+
+    await Task.WhenAll(tasks);
+    Console.WriteLine($"[PUSH] broadcasted {fileName} to {Subscribers.Count} subscriber(s)");
+}
+```
+
+### クライアント側（受信）
+
+サブスクライバは、接続直後に `0x06` を1回送ったあと、**常時受信ループ**で `0x10` を待ち受けて保存します：
+
+```
+send: [0x06]                   // SUBSCRIBE
+loop:
+  read: [byte cmd]
+  if cmd==0x10 (PUSH):
+     read [int32 nameLen][name][int64 bodyLen][body]
+     -> save to disk
+  else:
+     // 既存の応答（PONGやSUBSCRIBEDなど）を適宜ハンドル
+```
+
+> 既存の PULL 型 (`DOWNLOAD`) と共存できます。PUSH を嫌う端末は SUBSCRIBE を送らなければ、今まで通り必要なときだけ DOWNLOAD すればOK。
+
+---
+
+## どっちを選ぶべき？
+
+* **手早く“1→多”を実現**したい：➡ **クライアント多重アップロード**（方法1）
+  配布先の数が多くても、並列数を制御しやすく、失敗/成功の集計も簡単。
+
+* **サーバーが**「誰かのUPを**自動で**他クライアントへ配りたい」：➡ **ブロードキャスト**（方法2）
+  配信サブスクライバを保持するだけで、自動反映ができます（ログ収集・アセット配布などに便利）。
+
+---
+
+## 既存の安全機能との整合
+
+* **サイズ上限**・**アトミック保存**は方法1/2どちらでもそのまま有効。
+* ブロードキャスト時は**PUSH先での書き込みもアトミック**にしたいなら、クライアント側保存も「一時ファイル→Move」にしてください。
+
+---
+
+必要なら、**PUSH 受信用の最小クライアント**（`0x06`送って `0x10`を保存）のコードもすぐ出します。どちらの方式から入れますか？
+
+了解！最小限だけど実用的に動く **PUSH 受信用クライアント**（`0x06`=SUBSCRIBE を送って、サーバーからの `0x10`=PUSH を受け取り保存）の .NET 8 コンソール例です。
+保存は**アトミック**（一時ファイル→`Move`）で行い、`Ctrl+C` で終了できます。
+
+---
+
+## Program.cs（最小クライアント）
+
+```csharp
+// dotnet new console -n PushClient && cd PushClient
+// 置き換えて: dotnet run -- 127.0.0.1 5000 ./downloads
+using System.Buffers.Binary;
+using System.Net.Sockets;
+using System.Text;
+
+string host = args.Length >= 1 ? args[0] : "127.0.0.1";
+int port    = args.Length >= 2 ? int.Parse(args[1]) : 5000;
+string outDir = args.Length >= 3 ? args[2] : "./downloads";
+
+Directory.CreateDirectory(outDir);
+
+using var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+Console.WriteLine($"Connecting to {host}:{port} ...");
+using var tcp = new TcpClient();
+await tcp.ConnectAsync(host, port, cts.Token);
+using var s = tcp.GetStream();
+
+// ---- SUBSCRIBE (0x06) ----
+await s.WriteAsync(new byte[] { 0x06 }, cts.Token);
+// （任意）サーバーから "SUBSCRIBED\n" 等のレスポンスが来る場合もありますが、なくてもOK
+
+Console.WriteLine("Subscribed. Waiting for PUSH frames (0x10) ...  Press Ctrl+C to exit.");
+
+// 受信ループ
+try
+{
+    while (!cts.IsCancellationRequested)
+    {
+        int cmd = s.ReadByte();
+        if (cmd == -1) break; // 切断
+        if ((byte)cmd != 0x10)
+        {
+            // 他のサーバー応答（PONG など）はここに来る可能性あり。今回は読み飛ばし。
+            // 必要なら行単位で読む等の処理を足してもよい。
+            continue;
+        }
+
+        // PUSH frame: [0x10][int32 nameLen][name][int64 bodyLen][body]
+        int nameLen = await ReadInt32LEAsync(s, cts.Token);
+        if (nameLen <= 0 || nameLen > 4096) throw new InvalidOperationException("bad name length");
+
+        string fileName = await ReadUtf8Async(s, nameLen, cts.Token);
+        fileName = SanitizeFileName(fileName);
+
+        long bodyLen = await ReadInt64LEAsync(s, cts.Token);
+        if (bodyLen < 0) throw new InvalidOperationException("bad body length");
+
+        string destPath = Path.GetFullPath(Path.Combine(outDir, fileName));
+        Directory.CreateDirectory(Path.GetDirectoryName(destPath)!);
+
+        // アトミック保存：同一ディレクトリに一時ファイルを作ってから Move
+        string tempPath = Path.Combine(Path.GetDirectoryName(destPath)!,
+                                       $".{Path.GetFileName(destPath)}.{Guid.NewGuid():N}.tmp");
+
+        long received = 0;
+        try
+        {
+            await using var fs = new FileStream(
+                tempPath,
+                new FileStreamOptions {
+                    Mode = FileMode.CreateNew,
+                    Access = FileAccess.Write,
+                    Share = FileShare.None,
+                    Options = FileOptions.Asynchronous /* | FileOptions.WriteThrough */
+                });
+
+            var buf = new byte[81920];
+            long remaining = bodyLen;
+
+            while (remaining > 0)
+            {
+                int toRead = (int)Math.Min(buf.Length, remaining);
+                int n = await s.ReadAsync(buf.AsMemory(0, toRead), cts.Token);
+                if (n == 0) throw new IOException("unexpected EOF while receiving body");
+                await fs.WriteAsync(buf.AsMemory(0, n), cts.Token);
+                remaining -= n;
+                received += n;
+            }
+
+            await fs.FlushAsync(cts.Token);
+            // fs.Flush(true); // .NET 8 以降・信頼性重視なら
+
+            File.Move(tempPath, destPath, overwrite: true);
+            Console.WriteLine($"[PUSH] saved: {destPath} ({received} bytes)");
+        }
+        catch
+        {
+            try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { /* ignore */ }
+            throw;
+        }
+    }
+}
+catch (OperationCanceledException) { /* Ctrl+C */ }
+
+Console.WriteLine("bye");
+
+// ===== helpers =====
+static async Task<int> ReadInt32LEAsync(NetworkStream s, CancellationToken ct)
+{
+    var buf = new byte[4];
+    int off = 0;
+    while (off < 4)
+    {
+        int n = await s.ReadAsync(buf.AsMemory(off), ct);
+        if (n == 0) throw new IOException("unexpected EOF (int32)");
+        off += n;
+    }
+    return BinaryPrimitives.ReadInt32LittleEndian(buf);
+}
+
+static async Task<long> ReadInt64LEAsync(NetworkStream s, CancellationToken ct)
+{
+    var buf = new byte[8];
+    int off = 0;
+    while (off < 8)
+    {
+        int n = await s.ReadAsync(buf.AsMemory(off), ct);
+        if (n == 0) throw new IOException("unexpected EOF (int64)");
+        off += n;
+    }
+    return BinaryPrimitives.ReadInt64LittleEndian(buf);
+}
+
+static async Task<string> ReadUtf8Async(NetworkStream s, int len, CancellationToken ct)
+{
+    var buf = new byte[len];
+    int off = 0;
+    while (off < len)
+    {
+        int n = await s.ReadAsync(buf.AsMemory(off), ct);
+        if (n == 0) throw new IOException("unexpected EOF (utf8)");
+        off += n;
+    }
+    return Encoding.UTF8.GetString(buf);
+}
+
+static string SanitizeFileName(string name)
+{
+    foreach (var c in Path.GetInvalidFileNameChars()) name = name.Replace(c, '_');
+    name = name.Replace("/", "_").Replace("\\", "_").Replace("..", "_");
+    return name;
+}
+```
+
+### 使い方
+
+```bash
+dotnet run -- 127.0.0.1 5000 ./downloads
+# サーバー側が PUSH (0x10) を送るたびに ./downloads にアトミック保存されます
+```
+
+### メモ
+
+* **PUSHの並び**：このクライアントは1接続1スレッドで順次保存（十分シンプル）。大量同時配信でも着実に処理できます。
+* **保存先**：第三引数で保存ディレクトリ指定（無指定なら `./downloads`）。サーバーから届くファイル名はサニタイズ済み。
+* **TLS** が必要なら `NetworkStream` の上に `SslStream` を載せ替えてください。
+* **サイズ上限**を設けたい場合は、ヘッダ受信直後に `bodyLen` をチェックして中断してください。
+
+必要なら **PUSH + 通常応答（PONG 等）の混在をきれいに扱う拡張**や、**到着ファイルのハッシュ検証**も足せます。
