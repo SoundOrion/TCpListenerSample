@@ -1,3 +1,154 @@
+OK！**ポート0で動的割当→実際に割り当てられたポート番号を取得してクライアント接続**する版です。
+サーバは `Start()` 後に `((IPEndPoint)_listener.LocalEndpoint).Port` から実ポートを取れます。
+
+# サーバ実装（動的ポート対応）
+
+```csharp
+// EchoServer/EchoServer.cs
+using System.Net;
+using System.Net.Sockets;
+
+public sealed class EchoServer
+{
+    private readonly TcpListener _listener;
+
+    public EchoServer(IPAddress ip, int port /* 0=動的 */)
+    {
+        _listener = new TcpListener(ip, port);
+    }
+
+    /// <summary>Start後に実際の割当ポートを返す。Start前は0。</summary>
+    public int BoundPort
+        => _listener.Server is { LocalEndPoint: IPEndPoint ep } ? ep.Port : 0;
+
+    /// <summary>Start後の実際のLocalEndPoint。</summary>
+    public IPEndPoint? LocalEndPoint
+        => _listener.Server is { LocalEndPoint: IPEndPoint ep } ? ep : null;
+
+    public void Start() => _listener.Start();
+
+    public void Stop() => _listener.Stop();
+
+    public async Task RunAsync(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            TcpClient client;
+            try
+            {
+                client = await _listener.AcceptTcpClientAsync(ct);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            _ = HandleClientAsync(client, ct); // fire-and-forget（Task.Run不使用）
+        }
+    }
+
+    private static async Task HandleClientAsync(TcpClient client, CancellationToken ct)
+    {
+        using var _ = client;
+        using var stream = client.GetStream();
+
+        var buffer = new byte[4096];
+        while (!ct.IsCancellationRequested)
+        {
+            var n = await stream.ReadAsync(buffer.AsMemory(), ct);
+            if (n == 0) break;
+            await stream.WriteAsync(buffer.AsMemory(0, n), ct);
+        }
+    }
+}
+```
+
+```csharp
+// EchoServer/Program.cs
+using System.Net;
+
+var cts = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+
+// ポート0で動的割り当て
+var server = new EchoServer(IPAddress.Loopback, 0);
+server.Start();
+
+// Start後に確定したポートを取得
+var port = server.BoundPort;
+Console.WriteLine($"listening on :{port} (TcpListener/port0)");
+
+try
+{
+    await server.RunAsync(cts.Token);
+}
+finally
+{
+    server.Stop();
+}
+```
+
+# MSTest（動的ポートで衝突回避）
+
+```csharp
+// EchoServer.Tests/EchoServerPort0Tests.cs
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+namespace EchoServer.Tests;
+
+[TestClass]
+public class EchoServerPort0Tests
+{
+    [TestMethod]
+    public async Task Binds_To_Dynamic_Port_And_Echoes()
+    {
+        var cts = new CancellationTokenSource();
+        var server = new EchoServer(IPAddress.Loopback, 0); // 0で要求
+
+        server.Start();
+        var port = server.BoundPort;
+        Assert.AreNotEqual(0, port, "Port should be assigned after Start()");
+
+        var serverTask = server.RunAsync(cts.Token); // Task.Runは使わない
+
+        try
+        {
+            using var client = new TcpClient();
+            await client.ConnectAsync(IPAddress.Loopback, port);
+
+            using var s = client.GetStream();
+            var msg = "hello port0";
+            var bytes = Encoding.UTF8.GetBytes(msg);
+
+            await s.WriteAsync(bytes, 0, bytes.Length, cts.Token);
+
+            var buf = new byte[1024];
+            var n = await s.ReadAsync(buf.AsMemory(), cts.Token);
+
+            var echoed = Encoding.UTF8.GetString(buf, 0, n);
+            Assert.AreEqual(msg, echoed);
+        }
+        finally
+        {
+            cts.Cancel();
+            server.Stop();
+            await Task.WhenAny(serverTask, Task.Delay(3000));
+        }
+    }
+}
+```
+
+## 使い方メモ
+
+* **IPv4/IPv6**：`IPAddress.Loopback` は `127.0.0.1`。IPv6 を使うなら `IPAddress.IPv6Loopback` でもOK。
+* **本番運用**：動的ポートは“衝突回避”には便利ですが、**外部から固定ポートで到達させる構成**では向きません（その場合は固定ポート + 監視）。
+* **テスト並列実行**：各テストで `0` 指定にしておけば、同時に走ってもポート競合しにくくなります。
+
+必要なら、**TLS(SslStream)を被せた動的ポート**や、**IPv6/デュアルスタック**の例も出します。
+
+
 いいね、そのサンプルを「どう使うか」と「MSTestで自動テストする方法」を一気にいきます。
 （.NET 8 / C# 12 前提）
 
