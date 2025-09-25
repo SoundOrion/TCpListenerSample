@@ -624,3 +624,238 @@ static async Task WriteInt32LEAsync(NetworkStream s, int value)
 
 この形なら「手動確認」「更新があれば取得」「サーバーの起動待ち」が全部こなせます。
 必要なら **Pipelines 版**でも同じコマンドを実装したサンプルを出します（大容量・高頻度の更新に強いです）。
+
+
+いいね、**サイズ上限**と**アトミック保存**を入れた改修を置いておきます。
+ポイントは以下の2つだけです。
+
+* 受信前に `bodyLen` をチェック（上限超なら即エラー）。受信途中でも**累積**を見て超えたら中断＆一時ファイル削除。
+* まず**同じディレクトリ**に一時ファイルへ書き切り、`File.Move(temp, dest, overwrite: true)`（同一ボリューム内なら実質アトミック）で置き換え。失敗時は temp を削除。
+
+> OS/ファイルシステムに依存しますが、**同一ボリューム**内の `rename`/`move` は一般にアトミックです。確実性を高めたい場合は Windows では `File.Replace`（バックアップ付き）、Linux/Unix では同一ディレクトリに `rename` が基本です。
+
+---
+
+# 1) TcpListener / NetworkStream 版：`UPLOAD` ハンドラ差し替え
+
+```csharp
+// 例: 先のサーバーの定数として
+const long MaxUploadBytes = 1L * 1024 * 1024 * 1024; // 1 GiB 上限（適宜変更）
+
+static async Task HandleUploadAsync(NetworkStream s, CancellationToken ct)
+{
+    int nameLen = await ReadInt32LEAsync(s, ct);
+    if (nameLen <= 0 || nameLen > 4096) throw new InvalidOperationException("bad name length");
+
+    var nameBuf = new byte[nameLen];
+    await ReadExactlyAsync(s, nameBuf, ct);
+    var fileName = SanitizeFileName(Encoding.UTF8.GetString(nameBuf));
+
+    long bodyLen = await ReadInt64LEAsync(s, ct);
+    if (bodyLen < 0) throw new InvalidOperationException("bad file length");
+    if (bodyLen > MaxUploadBytes) throw new InvalidOperationException($"file too large (>{MaxUploadBytes} bytes)");
+
+    var destPath = Path.GetFullPath(fileName);
+    var dir = Path.GetDirectoryName(destPath)!;
+    Directory.CreateDirectory(dir);
+
+    // 同一ディレクトリに temp（同一ボリューム＝アトミック move が効く）
+    var tempPath = Path.Combine(dir, $".{Path.GetFileName(destPath)}.{Guid.NewGuid():N}.tmp");
+
+    long received = 0;
+    try
+    {
+        // WriteThrough は任意。確実性重視なら true（速度は落ちる）。
+        await using var fs = new FileStream(
+            tempPath,
+            new FileStreamOptions {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                Options = FileOptions.Asynchronous /* | FileOptions.WriteThrough */
+            });
+
+        var buffer = new byte[81920];
+        long remaining = bodyLen;
+
+        while (remaining > 0)
+        {
+            int toRead = (int)Math.Min(buffer.Length, remaining);
+            int read = await s.ReadAsync(buffer.AsMemory(0, toRead), ct);
+            if (read == 0) throw new IOException("unexpected EOF");
+            await fs.WriteAsync(buffer.AsMemory(0, read), ct);
+
+            remaining -= read;
+            received += read;
+            if (received > MaxUploadBytes) throw new InvalidOperationException("file too large (stream)");
+        }
+
+        await fs.FlushAsync(ct);        // バッファ flush
+        // 可能ならディスクへも flush（Windows .NET 8 以降は Flush(flushToDisk: true) が使える）
+        // fs.Flush(true);
+
+        // 目的ファイルへアトミック置換（.NET 8 以降）
+        File.Move(tempPath, destPath, overwrite: true);
+        Console.WriteLine($"[UPLOAD] {destPath} ({received} bytes)");
+
+        await s.WriteAsync(Encoding.UTF8.GetBytes("OK\n"), ct);
+    }
+    catch
+    {
+        // 失敗時は temp を片付ける
+        try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { /* ignore */ }
+        throw;
+    }
+}
+```
+
+> **レガシー互換 `HandleLegacyUploadAsync`** も同様の手順（`tempPath` に書いてから `Move`）に差し替えてください。受信ループ中に `received` を加算し、上限超で中断＆削除、にするのがコツです。
+
+---
+
+# 2) Pipelines 版：`UPLOAD`/レガシーUPLOAD の保存をアトミックに
+
+`HandleUploadAsync` / `HandleLegacyUploadAsync` の「保存」部分だけを、**一時ファイル→`Move`** にします。`CopyFromPipeToStreamAsync` はそのまま使えます。
+
+```csharp
+const long MaxUploadBytes = 1L * 1024 * 1024 * 1024; // 1 GiB
+
+static async Task HandleUploadAsync(PipeReader reader, PipeWriter writer, CancellationToken ct)
+{
+    int nameLen = await ReadInt32LEAsync(reader, ct);
+    if (nameLen <= 0 || nameLen > 4096) throw new InvalidOperationException("bad name length");
+
+    var nameBytes = await ReadExactlyToArrayAsync(reader, nameLen, ct);
+    var fileName = SanitizeFileName(Encoding.UTF8.GetString(nameBytes));
+
+    long bodyLen = await ReadInt64LEAsync(reader, ct);
+    if (bodyLen < 0) throw new InvalidOperationException("bad file length");
+    if (bodyLen > MaxUploadBytes) throw new InvalidOperationException($"file too large (>{MaxUploadBytes} bytes)");
+
+    var destPath = Path.GetFullPath(fileName);
+    var dir = Path.GetDirectoryName(destPath)!;
+    Directory.CreateDirectory(dir);
+    var tempPath = Path.Combine(dir, $".{Path.GetFileName(destPath)}.{Guid.NewGuid():N}.tmp");
+
+    try
+    {
+        await using (var fs = new FileStream(
+            tempPath,
+            new FileStreamOptions {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                Options = FileOptions.Asynchronous /* | FileOptions.WriteThrough */
+            }))
+        {
+            // ここで bodyLen 分だけ PipeReader→FileStream にコピー
+            await CopyFromPipeToStreamWithMaxAsync(reader, fs, bodyLen, MaxUploadBytes, ct);
+
+            await fs.FlushAsync(ct);
+            // fs.Flush(true); // 可能なら
+        }
+
+        File.Move(tempPath, destPath, overwrite: true);
+        Console.WriteLine($"[UPLOAD] {destPath} ({bodyLen} bytes)");
+
+        WriteUtf8(writer, "OK\n");
+        await writer.FlushAsync(ct);
+    }
+    catch
+    {
+        try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+        throw;
+    }
+}
+
+static async Task HandleLegacyUploadAsync(PipeReader reader, PipeWriter writer, byte firstLenByte, CancellationToken ct)
+{
+    var rest3 = await ReadExactlyToArrayAsync(reader, 3, ct);
+    int nameLen = firstLenByte
+                | (rest3[0] << 8)
+                | (rest3[1] << 16)
+                | (rest3[2] << 24);
+    if (nameLen <= 0 || nameLen > 4096) throw new InvalidOperationException("bad name length");
+
+    var nameBytes = await ReadExactlyToArrayAsync(reader, nameLen, ct);
+    var fileName = SanitizeFileName(Encoding.UTF8.GetString(nameBytes));
+
+    long bodyLen = await ReadInt64LEAsync(reader, ct);
+    if (bodyLen < 0) throw new InvalidOperationException("bad file length");
+    if (bodyLen > MaxUploadBytes) throw new InvalidOperationException($"file too large (>{MaxUploadBytes} bytes)");
+
+    var destPath = Path.GetFullPath(fileName);
+    var dir = Path.GetDirectoryName(destPath)!;
+    Directory.CreateDirectory(dir);
+    var tempPath = Path.Combine(dir, $".{Path.GetFileName(destPath)}.{Guid.NewGuid():N}.tmp");
+
+    try
+    {
+        await using (var fs = new FileStream(
+            tempPath,
+            new FileStreamOptions {
+                Mode = FileMode.CreateNew,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                Options = FileOptions.Asynchronous /* | FileOptions.WriteThrough */
+            }))
+        {
+            await CopyFromPipeToStreamWithMaxAsync(reader, fs, bodyLen, MaxUploadBytes, ct);
+            await fs.FlushAsync(ct);
+        }
+
+        File.Move(tempPath, destPath, overwrite: true);
+        Console.WriteLine($"[UPLOAD-legacy] {destPath} ({bodyLen} bytes)");
+
+        WriteUtf8(writer, "OK\n");
+        await writer.FlushAsync(ct);
+    }
+    catch
+    {
+        try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+        throw;
+    }
+}
+
+// 受信を bodyLen と Max の両方で監視しつつコピー
+static async ValueTask CopyFromPipeToStreamWithMaxAsync(
+    PipeReader reader, Stream dest, long bodyLen, long maxBytes, CancellationToken ct)
+{
+    long remaining = bodyLen;
+    long received = 0;
+
+    while (remaining > 0)
+    {
+        var result = await reader.ReadAsync(ct);
+        var buf = result.Buffer;
+        if (buf.Length == 0 && result.IsCompleted) throw new IOException("unexpected EOF (body)");
+
+        var toTake = Math.Min(remaining, (long)buf.Length);
+        var slice = buf.Slice(0, toTake);
+
+        foreach (var seg in slice)
+        {
+            await dest.WriteAsync(seg, ct);
+            received += seg.Length;
+            if (received > maxBytes) throw new InvalidOperationException("file too large (stream)");
+        }
+
+        reader.AdvanceTo(slice.End);
+        remaining -= toTake;
+    }
+}
+```
+
+---
+
+## 補足メモ
+
+* **上限チェック**は「宣言サイズ（`bodyLen`）を先に弾く」＋「実受信量（`received`）でも弾く」の**二重化**が堅いです。
+  （宣言が小さくても異常系でオーバーする可能性を潰す）
+* **アトミック性**：同一ディレクトリ内 `Move` は一般的にアトミック（同一ボリューム前提）。
+  Windows ではさらに確実にするなら `File.Replace(temp, dest, backupPath, ignoreMetadataErrors: true)` も検討可。
+* **ディスク flush**：障害耐性重視なら `FileStream.Flush(true)`（.NET 8）や WriteThrough を適用。性能と相談で。
+
+---
+
+必要なら、「上限超過時の**専用エラーコードを返す**」などプロトコルの応答も整えます（`ERR:TOO_LARGE\n` 等）。
